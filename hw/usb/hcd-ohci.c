@@ -1269,7 +1269,17 @@ static void ohci_frame_boundary(void *opaque)
         if (ohci->intr & ohci->intr_status) {
             ohci->done |= 1;
         }
-        hcca.done = cpu_to_le32(ohci->done);
+        /*
+         * Mask off bit 0 before writing done_head to HCCA.
+         *
+         * The Linux 2.6.24.3 OHCI driver's dl_reverse_done_list() does NOT
+         * mask bit 0 of done_head before calling dma_to_td(), causing hash
+         * lookup failure ("bad entry") when the WritebackDone flag is set.
+         *
+         * By masking bit 0 here, the kernel reads the correct TD address
+         * and can find it in its hash table.
+         */
+        hcca.done = cpu_to_le32(ohci->done & ~1);
         ohci->done = 0;
         ohci->done_count = 7;
         ohci_set_interrupt(ohci, OHCI_INTR_WD);

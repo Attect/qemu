@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
@@ -95,6 +96,57 @@ enum usbstring_idx {
 
 #define LOG2_STATUS_INTERVAL_MSEC       5    /* 1 << 5 == 32 msec */
 #define STATUS_BYTECOUNT                16   /* 8 byte header + data */
+
+/*
+ * DM9601-specific definitions
+ */
+#define DM9601_VENDOR_NUM               0x0a46  /* Davicom */
+#define DM9601_PRODUCT_NUM              0x9601  /* DM9601 */
+
+/* DM9601 registers */
+#define DM_NET_CTRL     0x00
+#define DM_RX_CTRL      0x05
+#define DM_SHARED_CTRL  0x0b
+#define DM_SHARED_ADDR  0x0c
+#define DM_SHARED_DATA  0x0d
+#define DM_PHY_ADDR     0x10
+#define DM_MCAST_ADDR   0x16
+#define DM_GPR_CTRL     0x1e
+#define DM_GPR_DATA     0x1f
+#define DM_CHIP_ID      0x2c
+
+/* DM9601 control requests */
+#define DM_READ_REGS    0x00
+#define DM_WRITE_REGS   0x01
+#define DM_READ_MEMS    0x02
+#define DM_WRITE_REG    0x03
+#define DM_WRITE_MEMS   0x05
+#define DM_WRITE_MEM    0x07
+
+/* DM9601 register values */
+#define DM_NET_CTRL_RESET       0x01
+#define DM_RX_CTRL_ENABLE       0x31
+#define DM_GPR_CTRL_PHY_POWER   0x01
+#define DM_CHIP_ID_DM9601       0x00
+
+/* DM9601 status interrupt format (8 bytes) */
+#define DM9601_STATUS_BYTECOUNT 8
+#define DM9601_INT_INTERVAL_MSEC 32  /* same 32ms polling */
+
+/* DM9601 frame format constants */
+#define DM9601_HEADER_LEN       3   /* RX: status(1) + length(2) */
+#define DM9601_TX_HEADER_LEN    2   /* TX: length(2) */
+#define DM9601_CRC_LEN          4   /* RX: CRC(4) */
+
+/* DM9601 PHY simulation */
+#define DM9601_PHY_ID1          0x0182  /* Davicom PHY ID high */
+#define DM9601_PHY_ID2          0x0a00  /* Davicom PHY ID low */
+
+/* Shared bus control bits */
+#define DM_SHARED_CTRL_START    0x01
+#define DM_SHARED_CTRL_WRITE    0x02
+#define DM_SHARED_CTRL_READ     0x04
+#define DM_SHARED_CTRL_PHY      0x08
 
 #define ETH_FRAME_LEN                   1514 /* Max. octets in frame sans FCS */
 
@@ -300,6 +352,67 @@ static const USBDesc desc_net = {
         .iSerialNumber     = STRING_SERIALNUMBER,
     },
     .full = &desc_device_net,
+    .str  = usb_net_stringtable,
+};
+
+/*
+ * DM9601 USB descriptors - single interface, vendor-class (0xFF)
+ */
+static const USBDescIface desc_iface_dm9601[] = {
+    {
+        .bInterfaceNumber              = 0,
+        .bNumEndpoints                 = 3,
+        .bInterfaceClass               = 0xFF,
+        .bInterfaceSubClass            = 0x00,
+        .bInterfaceProtocol            = 0x00,
+        .iInterface                    = STRING_DATA,
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x01,
+                .bmAttributes          = USB_ENDPOINT_XFER_INT,
+                .wMaxPacketSize        = DM9601_STATUS_BYTECOUNT,
+                .bInterval             = 0x01,
+            },{
+                .bEndpointAddress      = USB_DIR_OUT | 0x02,
+                .bmAttributes          = USB_ENDPOINT_XFER_BULK,
+                .wMaxPacketSize        = 0x40,
+            },{
+                .bEndpointAddress      = USB_DIR_IN | 0x02,
+                .bmAttributes          = USB_ENDPOINT_XFER_BULK,
+                .wMaxPacketSize        = 0x40,
+            },
+        }
+    }
+};
+
+static const USBDescDevice desc_device_dm9601 = {
+    .bcdUSB                        = 0x0200,
+    .bDeviceClass                  = 0xFF,
+    .bMaxPacketSize0               = 0x40,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STRING_CDC,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+            .bMaxPower             = 0x32,
+            .nif = ARRAY_SIZE(desc_iface_dm9601),
+            .ifs = desc_iface_dm9601,
+        }
+    },
+};
+
+static const USBDesc desc_dm9601 = {
+    .id = {
+        .idVendor          = DM9601_VENDOR_NUM,
+        .idProduct         = DM9601_PRODUCT_NUM,
+        .bcdDevice         = 0,
+        .iManufacturer     = STRING_MANUFACTURER,
+        .iProduct          = STRING_PRODUCT,
+        .iSerialNumber     = STRING_SERIALNUMBER,
+    },
+    .full = &desc_device_dm9601,
     .str  = usb_net_stringtable,
 };
 
@@ -649,6 +762,11 @@ struct USBNetState {
     NICState *nic;
     NICConf conf;
     QTAILQ_HEAD(, rndis_response) rndis_resp;
+
+    /* DM9601 mode */
+    bool dm9601;
+    uint8_t dm9601_regs[256];  /* DM9601 internal register file */
+    uint16_t dm9601_phy_regs[32];  /* MII PHY registers */
 };
 
 #define TYPE_USB_NET "usb-net"
@@ -1061,12 +1179,220 @@ static void usb_net_handle_reset(USBDevice *dev)
 {
 }
 
+/*
+ * DM9601 Register I/O
+ */
+static void dm9601_update_phy_link(USBNetState *s)
+{
+    /* BMSR bit 2 = link status */
+    if (s->nic && qemu_get_queue(s->nic)->link_down) {
+        s->dm9601_phy_regs[1] &= ~0x0004;  /* Link down */
+    } else {
+        s->dm9601_phy_regs[1] |= 0x0004;   /* Link up */
+        s->dm9601_phy_regs[1] |= 0x0020;   /* Auto-negotiation complete */
+    }
+}
+
+static void dm9601_init_phy(USBNetState *s)
+{
+    /* MII_BMSR: capabilities */
+    s->dm9601_phy_regs[1] = 0x782d;  /* Link, AN complete, capabilities */
+    /* MII_PHYSID1 */
+    s->dm9601_phy_regs[2] = DM9601_PHY_ID1;
+    /* MII_PHYSID2 */
+    s->dm9601_phy_regs[3] = DM9601_PHY_ID2;
+    /* MII_ADVERTISE: 10/100 full/half */
+    s->dm9601_phy_regs[4] = 0x01e1;
+    /* Auto-negotiation link partner ability */
+    s->dm9601_phy_regs[5] = 0x41e1;
+    /* MII_BMCR: auto-negotiation enabled, not reset */
+    s->dm9601_phy_regs[0] = 0x1000;
+    
+    dm9601_update_phy_link(s);
+}
+
+
+static uint16_t dm9601_phy_read(USBNetState *s, uint8_t reg)
+{
+    dm9601_update_phy_link(s);
+    if (reg >= 32) return 0xffff;
+    return s->dm9601_phy_regs[reg];
+}
+
+static void dm9601_shared_bus_execute(USBNetState *s)
+{
+    uint8_t addr = s->dm9601_regs[DM_SHARED_ADDR];
+    uint8_t ctrl = s->dm9601_regs[DM_SHARED_CTRL];
+    
+    if (ctrl & DM_SHARED_CTRL_PHY) {
+        /* PHY access */
+        uint8_t phy_reg = addr & 0x1f;
+        if (ctrl & DM_SHARED_CTRL_READ) {
+            uint16_t val = dm9601_phy_read(s, phy_reg);
+            s->dm9601_regs[DM_SHARED_DATA] = val & 0xff;
+            s->dm9601_regs[DM_SHARED_DATA + 1] = (val >> 8) & 0xff;
+        } else if (ctrl & DM_SHARED_CTRL_WRITE) {
+            uint16_t val = s->dm9601_regs[DM_SHARED_DATA] |
+                           (s->dm9601_regs[DM_SHARED_DATA + 1] << 8);
+            if (phy_reg < 32) {
+                s->dm9601_phy_regs[phy_reg] = val;
+            }
+        }
+    } else {
+        /* EEPROM access - simulate empty/read-only EEPROM */
+        if (ctrl & DM_SHARED_CTRL_READ) {
+            s->dm9601_regs[DM_SHARED_DATA] = 0xff;
+            s->dm9601_regs[DM_SHARED_DATA + 1] = 0xff;
+        }
+        /* EEPROM writes silently ignored (read-only) */
+    }
+    
+    /* Operation complete - ensure START bit (bit 0) is cleared for poll */
+    s->dm9601_regs[DM_SHARED_CTRL] &= ~DM_SHARED_CTRL_START;
+}
+
+static uint8_t dm9601_read_reg(USBNetState *s, uint8_t reg)
+{
+    uint8_t val;
+    
+    switch (reg) {
+    case DM_PHY_ADDR:     /* MAC address (6 bytes, read from conf) */
+    case DM_PHY_ADDR + 1:
+    case DM_PHY_ADDR + 2:
+    case DM_PHY_ADDR + 3:
+    case DM_PHY_ADDR + 4:
+    case DM_PHY_ADDR + 5:
+        return s->conf.macaddr.a[reg - DM_PHY_ADDR];
+    
+    case DM_CHIP_ID:      /* Chip ID: 0 = DM9601 */
+        return DM_CHIP_ID_DM9601;
+    
+    default:
+        val = s->dm9601_regs[reg];
+        return val;
+    }
+}
+
+static void dm9601_write_reg(USBNetState *s, uint8_t reg, uint8_t value)
+{
+    switch (reg) {
+    case DM_NET_CTRL:
+        if (value & DM_NET_CTRL_RESET) {
+            /* Software reset - clear most registers */
+            memset(s->dm9601_regs, 0, sizeof(s->dm9601_regs));
+            dm9601_init_phy(s);
+            s->in_len = s->in_ptr = 0;
+            s->out_ptr = 0;
+        }
+        s->dm9601_regs[reg] = value;
+        break;
+    
+    case DM_SHARED_CTRL:
+        s->dm9601_regs[reg] = value;
+        if (value != 0) {
+            dm9601_shared_bus_execute(s);
+            /* Ensure bit 0 (START/BUSY) reads as 0 = ready */
+            s->dm9601_regs[reg] &= ~DM_SHARED_CTRL_START;
+        }
+        break;
+    
+    case DM_RX_CTRL:
+        s->dm9601_regs[reg] = value;
+        break;
+    
+    case DM_MCAST_ADDR:
+    case DM_MCAST_ADDR + 1:
+    case DM_MCAST_ADDR + 2:
+    case DM_MCAST_ADDR + 3:
+    case DM_MCAST_ADDR + 4:
+    case DM_MCAST_ADDR + 5:
+    case DM_MCAST_ADDR + 6:
+    case DM_MCAST_ADDR + 7:
+        s->dm9601_regs[reg] = value;
+        break;
+    
+    case DM_GPR_CTRL:
+        s->dm9601_regs[reg] = value;
+        break;
+    
+    case DM_GPR_DATA:
+        s->dm9601_regs[reg] = value;
+        break;
+    
+    case DM_SHARED_ADDR:
+    case DM_SHARED_DATA:
+    case DM_SHARED_DATA + 1:
+        s->dm9601_regs[reg] = value;
+        break;
+    
+    default:
+        if (reg < 64) {
+            s->dm9601_regs[reg] = value;
+        }
+        break;
+    }
+}
+
 static void usb_net_handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
 {
     USBNetState *s = (USBNetState *) dev;
     int ret;
 
+    /* For DM9601 mode, handle vendor-specific requests */
+    if (s->dm9601) {
+        ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
+        if (ret >= 0) {
+            return;
+        }
+        
+        /* DM9601 vendor-specific control requests */
+        /* request = (bmRequestType << 8) | bRequest */
+        switch (request) {
+        case ((USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE) << 8) | DM_READ_REGS:
+        {
+            /* Vendor read request: read registers */
+            uint8_t reg = index & 0xff;
+            unsigned int len = length;
+            int i;
+            if (len > 64) len = 64;
+            for (i = 0; i < len; i++) {
+                data[i] = dm9601_read_reg(s, reg + i);
+            }
+            p->actual_length = len;
+            return;
+        }
+        
+        case ((USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE) << 8) | DM_WRITE_REGS:
+        {
+            /* Vendor write request: write registers */
+            uint8_t reg = index & 0xff;
+            unsigned int len = length;
+            int i;
+            if (len > 64) len = 64;
+            for (i = 0; i < len; i++) {
+                dm9601_write_reg(s, reg + i, data[i]);
+            }
+            return;
+        }
+        
+        case ((USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE) << 8) | DM_WRITE_REG:
+        {
+            /* Vendor write request: write single register */
+            uint8_t reg = index & 0xff;
+            uint8_t val = value & 0xff;
+            dm9601_write_reg(s, reg, val);
+            return;
+        }
+        
+        default:
+            p->status = USB_RET_STALL;
+            break;
+        }
+        return;
+    }
+
+    /* Original RNDIS/CDC control handling */
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
     if (ret >= 0) {
         return;
@@ -1136,6 +1462,29 @@ static void usb_net_handle_control(USBDevice *dev, USBPacket *p,
 
 static void usb_net_handle_statusin(USBNetState *s, USBPacket *p)
 {
+    if (s->dm9601) {
+        uint8_t status[DM9601_STATUS_BYTECOUNT];
+        uint8_t link_status;
+        
+        if (p->iov.size < DM9601_STATUS_BYTECOUNT) {
+            p->status = USB_RET_STALL;
+            return;
+        }
+        
+        /* Check link status */
+        dm9601_update_phy_link(s);
+        if (s->nic && !qemu_get_queue(s->nic)->link_down) {
+            link_status = 0x40;  /* bit6 = carrier */
+        } else {
+            link_status = 0x00;
+        }
+        
+        memset(status, 0, sizeof(status));
+        status[0] = link_status;  /* Network status: bit6=carrier */
+        usb_packet_copy(p, status, DM9601_STATUS_BYTECOUNT);
+        return;
+    }
+    
     le32 rbuf[2];
     uint16_t ebuf[4];
 
@@ -1169,7 +1518,7 @@ static void usb_net_handle_statusin(USBNetState *s, USBPacket *p)
 
 static void usb_net_handle_datain(USBNetState *s, USBPacket *p)
 {
-    int len;
+int len;
 
     if (s->in_ptr > s->in_len) {
         usb_net_reset_in_buf(s);
@@ -1187,7 +1536,7 @@ static void usb_net_handle_datain(USBNetState *s, USBPacket *p)
     usb_packet_copy(p, &s->in_buf[s->in_ptr], len);
     s->in_ptr += len;
     if (s->in_ptr >= s->in_len &&
-                    (is_rndis(s) || (s->in_len & (64 - 1)) || !len)) {
+                    (is_rndis(s) || s->dm9601 || (s->in_len & (64 - 1)) || !len)) {
         /* no short packet necessary */
         usb_net_reset_in_buf(s);
     }
@@ -1200,42 +1549,78 @@ static void usb_net_handle_datain(USBNetState *s, USBPacket *p)
 
 static void usb_net_handle_dataout(USBNetState *s, USBPacket *p)
 {
-    int sz = sizeof(s->out_buf) - s->out_ptr;
-    struct rndis_packet_msg_type *msg =
-            (struct rndis_packet_msg_type *) s->out_buf;
-    uint32_t len;
+    int sz;
+    
+    if (s->dm9601) {
+        /* DM9601 TX frame: [2-byte length][ethernet frame] */
+        sz = sizeof(s->out_buf) - s->out_ptr;
+        
+        if (sz > p->iov.size) {
+            sz = p->iov.size;
+        }
+        usb_packet_copy(p, &s->out_buf[s->out_ptr], sz);
+        s->out_ptr += sz;
+        
+        /* Check if we have a complete frame */
+        if (s->out_ptr >= DM9601_TX_HEADER_LEN) {
+            unsigned int frame_len = (s->out_buf[0] | (s->out_buf[1] << 8));
+            
+            if (frame_len > ETH_FRAME_LEN || frame_len == 0) {
+                /* Invalid frame length */
+                s->out_ptr = 0;
+                return;
+            }
+            
+            if (s->out_ptr >= frame_len + DM9601_TX_HEADER_LEN) {
+                /* Complete frame received */
+                uint8_t *pkt = s->out_buf + DM9601_TX_HEADER_LEN;
+                qemu_send_packet(qemu_get_queue(s->nic), pkt, frame_len);
+
+                s->out_ptr = 0;
+            }
+        }
+        return;
+    }
+    
+    {
+        struct rndis_packet_msg_type *msg =
+                (struct rndis_packet_msg_type *) s->out_buf;
+        uint32_t len;
+
+        sz = sizeof(s->out_buf) - s->out_ptr;
 
 #ifdef TRAFFIC_DEBUG
-    fprintf(stderr, "usbnet: data out len %zu\n", p->iov.size);
-    iov_hexdump(p->iov.iov, p->iov.niov, stderr, "usbnet", p->iov.size);
+        fprintf(stderr, "usbnet: data out len %zu\n", p->iov.size);
+        iov_hexdump(p->iov.iov, p->iov.niov, stderr, "usbnet", p->iov.size);
 #endif
 
-    if (sz > p->iov.size) {
-        sz = p->iov.size;
-    }
-    usb_packet_copy(p, &s->out_buf[s->out_ptr], sz);
-    s->out_ptr += sz;
+        if (sz > p->iov.size) {
+            sz = p->iov.size;
+        }
+        usb_packet_copy(p, &s->out_buf[s->out_ptr], sz);
+        s->out_ptr += sz;
 
-    if (!is_rndis(s)) {
-        if (p->iov.size % 64 || p->iov.size == 0) {
-            qemu_send_packet(qemu_get_queue(s->nic), s->out_buf, s->out_ptr);
-            s->out_ptr = 0;
+        if (!is_rndis(s)) {
+            if (p->iov.size % 64 || p->iov.size == 0) {
+                qemu_send_packet(qemu_get_queue(s->nic), s->out_buf, s->out_ptr);
+                s->out_ptr = 0;
+            }
+            return;
         }
-        return;
-    }
-    len = le32_to_cpu(msg->MessageLength);
-    if (s->out_ptr < 8 || s->out_ptr < len) {
-        return;
-    }
-    if (le32_to_cpu(msg->MessageType) == RNDIS_PACKET_MSG) {
-        uint32_t offs = 8 + le32_to_cpu(msg->DataOffset);
-        uint32_t size = le32_to_cpu(msg->DataLength);
-        if (offs < len && size < len && offs + size <= len) {
-            qemu_send_packet(qemu_get_queue(s->nic), s->out_buf + offs, size);
+        len = le32_to_cpu(msg->MessageLength);
+        if (s->out_ptr < 8 || s->out_ptr < len) {
+            return;
         }
+        if (le32_to_cpu(msg->MessageType) == RNDIS_PACKET_MSG) {
+            uint32_t offs = 8 + le32_to_cpu(msg->DataOffset);
+            uint32_t size = le32_to_cpu(msg->DataLength);
+            if (offs < len && size < len && offs + size <= len) {
+                qemu_send_packet(qemu_get_queue(s->nic), s->out_buf + offs, size);
+            }
+        }
+        s->out_ptr -= len;
+        memmove(s->out_buf, &s->out_buf[len], s->out_ptr);
     }
-    s->out_ptr -= len;
-    memmove(s->out_buf, &s->out_buf[len], s->out_ptr);
 }
 
 static void usb_net_handle_data(USBDevice *dev, USBPacket *p)
@@ -1285,6 +1670,7 @@ static void usb_net_handle_data(USBDevice *dev, USBPacket *p)
 static ssize_t usbnet_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     USBNetState *s = qemu_get_nic_opaque(nc);
+    
     uint8_t *in_buf = s->in_buf;
     size_t total_size = size;
 
@@ -1292,6 +1678,34 @@ static ssize_t usbnet_receive(NetClientState *nc, const uint8_t *buf, size_t siz
         return -1;
     }
 
+    if (s->dm9601) {
+        /* DM9601 RX: [status(1)][length(2)][data][CRC(4)] */
+        total_size = DM9601_HEADER_LEN + size + DM9601_CRC_LEN;
+        
+        if (total_size > sizeof(s->in_buf)) {
+            return -1;
+        }
+        
+        /* Only accept packet if buffer is empty */
+        if (s->in_len > 0) {
+            return 0;
+        }
+        
+        /* Build DM9601 RX frame */
+        in_buf[0] = 0x00;  /* RX status: success */
+        uint16_t rx_len = size + DM9601_CRC_LEN;
+        in_buf[1] = rx_len & 0xff;  /* length low (includes CRC) */
+        in_buf[2] = (rx_len >> 8) & 0xff;  /* length high (includes CRC) */
+        memcpy(in_buf + DM9601_HEADER_LEN, buf, size);
+        /* Append dummy CRC */
+        memset(in_buf + DM9601_HEADER_LEN + size, 0, DM9601_CRC_LEN);
+        
+        s->in_len = total_size;
+        s->in_ptr = 0;
+        usb_wakeup(s->bulk_in, 0);
+        return size;
+    }
+    
     if (is_rndis(s)) {
         if (s->rndis_state != RNDIS_DATA_INITIALIZED) {
             return -1;
@@ -1350,9 +1764,24 @@ static void usb_net_unrealize(USBDevice *dev)
     qemu_del_nic(s->nic);
 }
 
+static bool usbnet_can_receive(NetClientState *nc)
+{
+    USBNetState *s = qemu_get_nic_opaque(nc);
+    
+    /* Can receive only when USB configured and buffer empty */
+    if (!s->dev.config) {
+        return 0;
+    }
+    if (s->in_len > 0) {
+        return 0;
+    }
+    return 1;
+}
+
 static NetClientInfo net_usbnet_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
+    .can_receive = usbnet_can_receive,
     .receive = usbnet_receive,
     .cleanup = usbnet_cleanup,
 };
@@ -1395,7 +1824,7 @@ static void usb_net_realize(USBDevice *dev, Error **errp)
 static void usb_net_instance_init(Object *obj)
 {
     USBDevice *dev = USB_DEVICE(obj);
-    USBNetState *s = USB_NET(dev);
+    USBNetState *s = (USBNetState *)dev;
 
     device_add_bootindex_property(obj, &s->conf.bootindex,
                                   "bootindex", "/ethernet-phy@0",
@@ -1437,9 +1866,78 @@ static const TypeInfo net_info = {
     .instance_init = usb_net_instance_init,
 };
 
+static void usb_dm9601_realize(USBDevice *dev, Error **errp)
+{
+    USBNetState *s = (USBNetState *)dev;
+
+    /* Mark as DM9601 mode */
+    s->dm9601 = true;
+    
+    usb_desc_create_serial(dev);
+    usb_desc_init(dev);
+
+    s->rndis_state = RNDIS_UNINITIALIZED;
+    QTAILQ_INIT(&s->rndis_resp);
+
+    s->medium = 0;      /* NDIS_MEDIUM_802_3 */
+    s->speed = 1000000; /* 100MBps, in 100Bps units */
+    s->media_state = 0; /* NDIS_MEDIA_STATE_CONNECTED */;
+    s->filter = 0;
+    s->vendorid = 0x1234;
+    s->connection = 1;  /* Connected */
+    s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
+    s->bulk_in = usb_ep_get(dev, USB_TOKEN_IN, 2);
+
+    /* Initialize DM9601 register file and PHY */
+    memset(s->dm9601_regs, 0, sizeof(s->dm9601_regs));
+    dm9601_init_phy(s);
+
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&net_usbnet_info, &s->conf,
+                          object_get_typename(OBJECT(s)), s->dev.qdev.id,
+                          &s->dev.qdev.mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+    snprintf(s->usbstring_mac, sizeof(s->usbstring_mac),
+             "%02x%02x%02x%02x%02x%02x",
+             s->conf.macaddr.a[0],
+             s->conf.macaddr.a[1],
+             s->conf.macaddr.a[2],
+             s->conf.macaddr.a[3],
+             s->conf.macaddr.a[4],
+             s->conf.macaddr.a[5]);
+    usb_desc_set_string(dev, STRING_ETHADDR, s->usbstring_mac);
+}
+
+static void usb_dm9601_class_initfn(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_dm9601_realize;
+    uc->product_desc   = "Davicom DM9601 USB Ethernet Adapter";
+    uc->usb_desc       = &desc_dm9601;
+    uc->handle_reset   = usb_net_handle_reset;
+    uc->handle_control = usb_net_handle_control;
+    uc->handle_data    = usb_net_handle_data;
+    uc->unrealize      = usb_net_unrealize;
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+    dc->fw_name = "network";
+    dc->vmsd = &vmstate_usb_net;
+    device_class_set_props(dc, net_properties);
+}
+
+static const TypeInfo dm9601_info = {
+    .name          = "usb-dm9601",
+    .parent        = TYPE_USB_DEVICE,
+    .instance_size = sizeof(USBNetState),
+    .class_init    = usb_dm9601_class_initfn,
+    .instance_init = usb_net_instance_init,
+};
+
 static void usb_net_register_types(void)
 {
     type_register_static(&net_info);
+    type_register_static(&dm9601_info);
 }
 
 type_init(usb_net_register_types)
